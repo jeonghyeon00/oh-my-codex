@@ -73,6 +73,36 @@ describe('omx exec', () => {
     }
   });
 
+  it('preserves all follow-up prompts from concurrent injections', async () => {
+    const wd = await mkdtemp(join(tmpdir(), 'omx-exec-followup-concurrent-'));
+    try {
+      const session = await writeSessionStart(wd, 'omx-test-concurrent-followup');
+      const count = 25;
+      const results = await Promise.all(Array.from({ length: count }, async (_, index) => (
+        injectExecFollowup({
+          cwd: wd,
+          sessionId: session.session_id,
+          actor: `operator-${index}`,
+          prompt: `Concurrent follow-up ${index}`,
+          nowIso: '2026-04-27T10:01:00.000Z',
+        })
+      )));
+
+      const pending = await readPendingExecFollowups(wd, session.session_id);
+      assert.equal(pending.pending.length, count);
+      assert.deepEqual(
+        [...new Set(pending.pending.map((record) => record.id))].sort(),
+        results.map((result) => result.queued.id).sort(),
+      );
+      assert.deepEqual(
+        pending.pending.map((record) => record.prompt).sort(),
+        Array.from({ length: count }, (_, index) => `Concurrent follow-up ${index}`).sort(),
+      );
+    } finally {
+      await rm(wd, { recursive: true, force: true });
+    }
+  });
+
   it('delivers queued follow-ups through Stop hook output and marks them delivered', async () => {
     const wd = await mkdtemp(join(tmpdir(), 'omx-exec-followup-stop-'));
     try {
@@ -98,6 +128,34 @@ describe('omx exec', () => {
       };
       assert.equal(persisted.records[0]?.delivery_event, 'stop-hook');
       assert.ok(persisted.records[0]?.delivered_at);
+    } finally {
+      await rm(wd, { recursive: true, force: true });
+    }
+  });
+
+  it('quarantines malformed follow-up queue JSON instead of crashing Stop delivery', async () => {
+    const wd = await mkdtemp(join(tmpdir(), 'omx-exec-followup-corrupt-'));
+    try {
+      const session = await writeSessionStart(wd, 'omx-test-corrupt-followup');
+      const queuePath = join(wd, '.omx', 'state', 'sessions', session.session_id, 'exec-followups.json');
+      await mkdir(dirname(queuePath), { recursive: true });
+      await writeFile(queuePath, '{"version":1,"records":[', 'utf-8');
+
+      const output = await buildExecFollowupStopOutput(wd, session.session_id);
+      assert.equal(output, null);
+
+      const recovered = JSON.parse(await readFile(queuePath, 'utf-8')) as {
+        records: Array<Record<string, unknown>>;
+      };
+      assert.deepEqual(recovered.records, []);
+
+      const queueDirEntries = await readdir(dirname(queuePath));
+      assert.ok(
+        queueDirEntries.some((entry) => entry.startsWith('exec-followups.json.corrupt-')),
+        'malformed queue should be quarantined beside the recovered queue',
+      );
+      const auditPath = join(wd, '.omx', 'logs', `exec-followups-${new Date().toISOString().slice(0, 10)}.jsonl`);
+      assert.match(await readFile(auditPath, 'utf-8'), /exec_followup_queue_corrupt_recovered/);
     } finally {
       await rm(wd, { recursive: true, force: true });
     }

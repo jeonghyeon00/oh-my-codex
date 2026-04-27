@@ -1,6 +1,6 @@
 import { randomUUID } from "crypto";
 import { existsSync, readFileSync } from "fs";
-import { appendFile, mkdir, readFile, writeFile } from "fs/promises";
+import { appendFile, mkdir, readFile, rename, rm, stat, writeFile } from "fs/promises";
 import { dirname, join } from "path";
 import { isSessionStateUsable, readUsableSessionState } from "../hooks/session.js";
 
@@ -35,6 +35,9 @@ export interface InjectExecFollowupResult {
 
 const QUEUE_FILE = "exec-followups.json";
 const SESSION_ID_PATTERN = /^[A-Za-z0-9_-]{1,128}$/;
+const QUEUE_LOCK_STALE_MS = 30_000;
+const QUEUE_LOCK_RETRY_MS = 10;
+const QUEUE_LOCK_MAX_WAIT_MS = 5_000;
 
 function stateDir(cwd: string): string {
   return join(cwd, ".omx", "state");
@@ -44,8 +47,24 @@ function sessionQueuePath(cwd: string, sessionId: string): string {
   return join(stateDir(cwd), "sessions", sessionId, QUEUE_FILE);
 }
 
+function sessionQueueLockPath(queuePath: string): string {
+  return `${queuePath}.lock`;
+}
+
 function auditLogPath(cwd: string, nowIso: string): string {
   return join(cwd, ".omx", "logs", `exec-followups-${nowIso.slice(0, 10)}.jsonl`);
+}
+
+function safeTimestampForPath(nowIso: string): string {
+  return nowIso.replace(/[^0-9A-Za-z_-]/g, "-");
+}
+
+function errorMessage(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
+}
+
+async function sleep(ms: number): Promise<void> {
+  await new Promise((resolve) => setTimeout(resolve, ms));
 }
 
 function normalizeSessionId(sessionId: string): string {
@@ -67,11 +86,69 @@ function normalizeActor(actor?: string): string {
   return normalized || "unknown";
 }
 
-async function readQueue(path: string, sessionId: string): Promise<ExecFollowupQueue> {
+async function appendAudit(cwd: string, event: Record<string, unknown>, nowIso: string): Promise<void> {
+  const path = auditLogPath(cwd, nowIso);
+  await mkdir(dirname(path), { recursive: true });
+  await appendFile(path, JSON.stringify({ ...event, timestamp: nowIso }) + "\n");
+}
+
+async function quarantineCorruptQueue(
+  path: string,
+  sessionId: string,
+  options: { cwd: string; nowIso: string; error: unknown },
+): Promise<ExecFollowupQueue> {
+  const quarantinePath = `${path}.corrupt-${safeTimestampForPath(options.nowIso)}`;
+  let quarantined = false;
+  try {
+    await rename(path, quarantinePath);
+    quarantined = true;
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== "ENOENT") {
+      await appendAudit(options.cwd, {
+        event: "exec_followup_queue_corrupt_quarantine_failed",
+        session_id: sessionId,
+        queue_path: path,
+        quarantine_path: quarantinePath,
+        error: errorMessage(error),
+        parse_error: errorMessage(options.error),
+      }, options.nowIso);
+    }
+  }
+
+  await appendAudit(options.cwd, {
+    event: "exec_followup_queue_corrupt_recovered",
+    session_id: sessionId,
+    queue_path: path,
+    ...(quarantined ? { quarantine_path: quarantinePath } : {}),
+    error: errorMessage(options.error),
+  }, options.nowIso);
+
+  const recovered: ExecFollowupQueue = { version: 1, session_id: sessionId, records: [] };
+  await writeQueue(path, recovered);
+  return recovered;
+}
+
+async function readQueue(
+  path: string,
+  sessionId: string,
+  options?: { cwd: string; nowIso: string; recoverCorrupt?: boolean },
+): Promise<ExecFollowupQueue> {
   if (!existsSync(path)) {
     return { version: 1, session_id: sessionId, records: [] };
   }
-  const parsed = JSON.parse(await readFile(path, "utf-8")) as Partial<ExecFollowupQueue>;
+  let parsed: Partial<ExecFollowupQueue>;
+  try {
+    parsed = JSON.parse(await readFile(path, "utf-8")) as Partial<ExecFollowupQueue>;
+  } catch (error) {
+    if (options?.recoverCorrupt) {
+      return await quarantineCorruptQueue(path, sessionId, {
+        cwd: options.cwd,
+        nowIso: options.nowIso,
+        error,
+      });
+    }
+    throw error;
+  }
   const records = Array.isArray(parsed.records) ? parsed.records : [];
   return {
     version: 1,
@@ -92,13 +169,47 @@ async function readQueue(path: string, sessionId: string): Promise<ExecFollowupQ
 
 async function writeQueue(path: string, queue: ExecFollowupQueue): Promise<void> {
   await mkdir(dirname(path), { recursive: true });
-  await writeFile(path, JSON.stringify(queue, null, 2) + "\n");
+  const tempPath = `${path}.${process.pid}.${randomUUID()}.tmp`;
+  await writeFile(tempPath, JSON.stringify(queue, null, 2) + "\n");
+  await rename(tempPath, path);
 }
 
-async function appendAudit(cwd: string, event: Record<string, unknown>, nowIso: string): Promise<void> {
-  const path = auditLogPath(cwd, nowIso);
-  await mkdir(dirname(path), { recursive: true });
-  await appendFile(path, JSON.stringify({ ...event, timestamp: nowIso }) + "\n");
+async function withQueueLock<T>(queuePath: string, operation: () => Promise<T>): Promise<T> {
+  await mkdir(dirname(queuePath), { recursive: true });
+  const lockPath = sessionQueueLockPath(queuePath);
+  const start = Date.now();
+  while (true) {
+    try {
+      await mkdir(lockPath);
+      await writeFile(join(lockPath, "owner.json"), JSON.stringify({
+        pid: process.pid,
+        acquired_at: new Date().toISOString(),
+      }, null, 2));
+      try {
+        return await operation();
+      } finally {
+        await rm(lockPath, { recursive: true, force: true });
+      }
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+
+      try {
+        const lockStat = await stat(lockPath);
+        if (Date.now() - lockStat.mtimeMs > QUEUE_LOCK_STALE_MS) {
+          await rm(lockPath, { recursive: true, force: true });
+          continue;
+        }
+      } catch (statError) {
+        if ((statError as NodeJS.ErrnoException).code === "ENOENT") continue;
+        throw statError;
+      }
+
+      if (Date.now() - start > QUEUE_LOCK_MAX_WAIT_MS) {
+        throw new Error("exec_followup_queue_lock_timeout");
+      }
+      await sleep(QUEUE_LOCK_RETRY_MS);
+    }
+  }
 }
 
 export async function injectExecFollowup(
@@ -119,7 +230,6 @@ export async function injectExecFollowup(
 
   const canonicalSessionId = active.session_id;
   const queuePath = sessionQueuePath(options.cwd, canonicalSessionId);
-  const queue = await readQueue(queuePath, canonicalSessionId);
   const queued: ExecFollowupRecord = {
     id: randomUUID(),
     session_id: canonicalSessionId,
@@ -127,9 +237,16 @@ export async function injectExecFollowup(
     prompt,
     created_at: nowIso,
   };
-  queue.session_id = canonicalSessionId;
-  queue.records.push(queued);
-  await writeQueue(queuePath, queue);
+  await withQueueLock(queuePath, async () => {
+    const queue = await readQueue(queuePath, canonicalSessionId, {
+      cwd: options.cwd,
+      nowIso,
+      recoverCorrupt: true,
+    });
+    queue.session_id = canonicalSessionId;
+    queue.records.push(queued);
+    await writeQueue(queuePath, queue);
+  });
   await appendAudit(options.cwd, {
     event: "exec_followup_queued",
     followup_id: queued.id,
@@ -146,7 +263,11 @@ export async function readPendingExecFollowups(
 ): Promise<{ queuePath: string; pending: ExecFollowupRecord[] }> {
   const canonicalSessionId = normalizeSessionId(sessionId);
   const queuePath = sessionQueuePath(cwd, canonicalSessionId);
-  const queue = await readQueue(queuePath, canonicalSessionId);
+  const queue = await readQueue(queuePath, canonicalSessionId, {
+    cwd,
+    nowIso: new Date().toISOString(),
+    recoverCorrupt: true,
+  });
   return {
     queuePath,
     pending: queue.records.filter((record) => !record.delivered_at),
@@ -162,23 +283,29 @@ export async function markExecFollowupsDelivered(
   const canonicalSessionId = normalizeSessionId(sessionId);
   const nowIso = options.nowIso ?? new Date().toISOString();
   const queuePath = sessionQueuePath(cwd, canonicalSessionId);
-  const queue = await readQueue(queuePath, canonicalSessionId);
-  const ids = new Set(followupIds);
-  let changed = false;
-  for (const record of queue.records) {
-    if (!ids.has(record.id) || record.delivered_at) continue;
-    record.delivered_at = nowIso;
-    record.delivery_event = options.deliveryEvent ?? "stop-hook";
-    changed = true;
-    await appendAudit(cwd, {
-      event: "exec_followup_delivered",
-      followup_id: record.id,
-      session_id: canonicalSessionId,
-      actor: record.actor,
-      delivery_event: record.delivery_event,
-    }, nowIso);
-  }
-  if (changed) await writeQueue(queuePath, queue);
+  await withQueueLock(queuePath, async () => {
+    const queue = await readQueue(queuePath, canonicalSessionId, {
+      cwd,
+      nowIso,
+      recoverCorrupt: true,
+    });
+    const ids = new Set(followupIds);
+    let changed = false;
+    for (const record of queue.records) {
+      if (!ids.has(record.id) || record.delivered_at) continue;
+      record.delivered_at = nowIso;
+      record.delivery_event = options.deliveryEvent ?? "stop-hook";
+      changed = true;
+      await appendAudit(cwd, {
+        event: "exec_followup_delivered",
+        followup_id: record.id,
+        session_id: canonicalSessionId,
+        actor: record.actor,
+        delivery_event: record.delivery_event,
+      }, nowIso);
+    }
+    if (changed) await writeQueue(queuePath, queue);
+  });
 }
 
 export async function buildExecFollowupStopOutput(
