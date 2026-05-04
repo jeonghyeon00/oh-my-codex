@@ -7896,11 +7896,6 @@ exit 0
       const stateDir = join(cwd, ".omx", "state");
       await mkdir(stateDir, { recursive: true });
       process.env.OMX_SESSION_ID = "sess-stop-auto-mode";
-      await writeJson(join(stateDir, "deep-interview-state.json"), {
-        active: true,
-        mode: "deep-interview",
-        current_phase: "intent-first",
-      });
 
       const result = await dispatchCodexNativeHook(
         {
@@ -7921,6 +7916,8 @@ exit 0
         systemMessage:
           "OMX native Stop detected a stall/permission-style handoff and continued the turn automatically.",
       });
+      const stopState = JSON.parse(await readFile(join(stateDir, "native-stop-state.json"), "utf-8")) as Record<string, unknown>;
+      assert.ok((stopState.sessions as Record<string, unknown>)["sess-stop-auto-mode"]);
     } finally {
       await rm(cwd, { recursive: true, force: true });
     }

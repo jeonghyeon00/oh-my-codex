@@ -1987,7 +1987,8 @@ function resolveRepeatableStopSessionId(
   payload: CodexHookPayload,
   canonicalSessionId?: string,
 ): string {
-  return canonicalSessionId?.trim() || readPayloadSessionId(payload) || "";
+  const inheritedSessionId = safeString(process.env.OMX_SESSION_ID || process.env.CODEX_SESSION_ID || process.env.SESSION_ID).trim();
+  return canonicalSessionId?.trim() || readPayloadSessionId(payload) || inheritedSessionId || "";
 }
 
 function isStateLevelStopSignatureKind(kind: string): boolean {
