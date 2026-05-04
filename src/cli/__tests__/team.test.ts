@@ -9,6 +9,7 @@ import { tmpdir } from 'node:os';
 import { fileURLToPath } from 'node:url';
 import { buildLeaderMonitoringHints, parseTeamStartArgs, teamCommand } from '../team.js';
 import { readModeState } from '../../modes/base.js';
+import { readApprovedExecutionLaunchHint } from '../../planning/artifacts.js';
 import { DEFAULT_MAX_WORKERS } from '../../team/state.js';
 import { sameFilePath } from '../../utils/paths.js';
 import {
@@ -22,7 +23,10 @@ import {
   writeTaskApproval,
   writeWorkerStatus,
 } from '../../team/state.js';
-import { writePersistedApprovedTeamExecutionBinding } from '../../team/approved-execution.js';
+import {
+  buildApprovedTeamExecutionBinding,
+  writePersistedApprovedTeamExecutionBinding,
+} from '../../team/approved-execution.js';
 import { isRealTmuxAvailable, withTempTmuxSession, type TempTmuxSessionFixture } from '../../team/__tests__/tmux-test-fixture.js';
 
 const OMX_CLI_PATH = fileURLToPath(new URL('../omx.js', import.meta.url));
@@ -307,7 +311,7 @@ describe('parseTeamStartArgs', () => {
     }
   });
 
-  it('preserves escaped apostrophes while keeping other backslashes in persisted approved follow-ups', async () => {
+  it('round-trips single-quoted approved follow-ups from launch hint encoding through persisted binding', async () => {
     const wd = await mkdtemp(join(tmpdir(), 'omx-team-followup-bound-quoted-'));
     const previousCwd = process.cwd();
     try {
@@ -327,11 +331,15 @@ describe('parseTeamStartArgs', () => {
         join(wd, '.omx', 'state', 'team-state.json'),
         JSON.stringify({ active: true, team_name: 'bound-team-quoted' }, null, 2),
       );
-      await writePersistedApprovedTeamExecutionBinding('bound-team-quoted', wd, {
-        prd_path: boundPrdPath,
-        task: boundTask,
-        command: boundCommand,
-      });
+      const approvedHint = readApprovedExecutionLaunchHint(wd, 'team');
+      assert.ok(approvedHint);
+      assert.equal(approvedHint?.task, boundTask);
+      assert.equal(approvedHint?.command, boundCommand);
+      await writePersistedApprovedTeamExecutionBinding(
+        'bound-team-quoted',
+        wd,
+        buildApprovedTeamExecutionBinding(approvedHint),
+      );
 
       const result = parseTeamStartArgs(['team']);
       assert.equal(result.parsed.task, boundTask);
@@ -345,7 +353,7 @@ describe('parseTeamStartArgs', () => {
     }
   });
 
-  it('preserves literal backslashes in double-quoted persisted approved follow-ups', async () => {
+  it('round-trips double-quoted approved follow-ups from launch hint encoding through persisted binding', async () => {
     const wd = await mkdtemp(join(tmpdir(), 'omx-team-followup-bound-double-quoted-'));
     const previousCwd = process.cwd();
     try {
@@ -365,11 +373,15 @@ describe('parseTeamStartArgs', () => {
         join(wd, '.omx', 'state', 'team-state.json'),
         JSON.stringify({ active: true, team_name: 'bound-team-double-quoted' }, null, 2),
       );
-      await writePersistedApprovedTeamExecutionBinding('bound-team-double-quoted', wd, {
-        prd_path: boundPrdPath,
-        task: boundTask,
-        command: boundCommand,
-      });
+      const approvedHint = readApprovedExecutionLaunchHint(wd, 'team');
+      assert.ok(approvedHint);
+      assert.equal(approvedHint?.task, boundTask);
+      assert.equal(approvedHint?.command, boundCommand);
+      await writePersistedApprovedTeamExecutionBinding(
+        'bound-team-double-quoted',
+        wd,
+        buildApprovedTeamExecutionBinding(approvedHint),
+      );
 
       const result = parseTeamStartArgs(['team']);
       assert.equal(result.parsed.task, boundTask);
