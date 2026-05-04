@@ -46,6 +46,7 @@ import { resolveAgentReasoningEffort, resolveTeamLowComplexityDefaultModel } fro
 import { readTeamEvents } from '../state/events.js';
 import { sanitizeTeamName } from '../tmux-session.js';
 import { buildInternalTeamName, resolveTeamIdentityScope } from '../team-identity.js';
+import { writePersistedApprovedTeamExecutionBinding } from '../approved-execution.js';
 
 async function initRepo(): Promise<string> {
   const cwd = await mkdtemp(join(tmpdir(), 'omx-runtime-worktree-repo-'));
@@ -5966,6 +5967,24 @@ esac
     }
   });
 
+  it('resumeTeam fails closed when the persisted approved binding is stale', async () => {
+    const cwd = await mkdtemp(join(tmpdir(), 'omx-runtime-approved-resume-'));
+    try {
+      await initTeamState('team-approved-resume', 'approved resume test', 'executor', 1, cwd);
+      await writePersistedApprovedTeamExecutionBinding('team-approved-resume', cwd, {
+        prd_path: join(cwd, '.omx', 'plans', 'prd-missing.md'),
+        task: 'Execute missing approved plan',
+      });
+
+      await assert.rejects(
+        () => resumeTeam('team-approved-resume', cwd),
+        /approved_execution_binding_stale:.*Execute missing approved plan/,
+      );
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
   it('resumeTeam returns null for prompt teams when worker handles are missing after restart', async () => {
     const cwd = await mkdtemp(join(tmpdir(), 'omx-runtime-prompt-resume-'));
     const sleeper = spawn(process.execPath, ['-e', 'setInterval(() => {}, 1000)'], {
@@ -6182,6 +6201,114 @@ esac
       if (runtime) {
         await shutdownTeam(runtime.teamName, cwd, { force: true }).catch(() => {});
       }
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
+  it('startTeam persists approved execution binding under the team state root', async () => {
+    const cwd = await mkdtemp(join(tmpdir(), 'omx-runtime-approved-binding-'));
+    const binDir = join(cwd, 'bin');
+    const fakeCodexPath = join(binDir, 'codex');
+    await mkdir(binDir, { recursive: true });
+    await mkdir(join(cwd, '.omx', 'plans'), { recursive: true });
+    await writeFile(
+      join(cwd, '.omx', 'plans', 'prd-issue-1314.md'),
+      '# Approved plan\n\nLaunch via omx team 1:executor "Execute approved issue 1314 plan"\n',
+    );
+    await writeFile(join(cwd, '.omx', 'plans', 'test-spec-issue-1314.md'), '# Test spec\n');
+    await writeFakePromptWorkerBinary(
+      fakeCodexPath,
+      `setTimeout(() => {}, 5000);`,
+    );
+
+    let runtime: TeamRuntime | null = null;
+    try {
+      runtime = await withPromptModeCodexEnv(binDir, {}, () =>
+        withoutTeamWorkerEnv(() =>
+          startTeam(
+            'team-approved-binding',
+            'approved binding persistence test',
+            'executor',
+            1,
+            [{ subject: 's', description: 'd', owner: 'worker-1' }],
+            cwd,
+            {
+              approvedExecution: {
+                prd_path: join(cwd, '.omx', 'plans', 'prd-issue-1314.md'),
+                task: 'Execute approved issue 1314 plan',
+                command: 'omx team 1:executor "Execute approved issue 1314 plan"',
+              },
+            },
+          ),
+        ),
+      );
+
+      const bindingPath = join(
+        runtime.config.team_state_root ?? join(cwd, '.omx', 'state'),
+        'team',
+        runtime.teamName,
+        'approved-execution.json',
+      );
+      const binding = JSON.parse(await readFile(bindingPath, 'utf-8')) as Record<string, string>;
+      assert.deepEqual(binding, {
+        prd_path: join(cwd, '.omx', 'plans', 'prd-issue-1314.md'),
+        task: 'Execute approved issue 1314 plan',
+        command: 'omx team 1:executor "Execute approved issue 1314 plan"',
+      });
+      assert.deepEqual(Object.keys(binding).sort(), ['command', 'prd_path', 'task']);
+    } finally {
+      if (runtime) {
+        await shutdownTeam(runtime.teamName, cwd, { force: true }).catch(() => {});
+      }
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
+  it('startTeam fails closed when an explicit approved execution binding is stale', async () => {
+    const cwd = await mkdtemp(join(tmpdir(), 'omx-runtime-approved-binding-stale-'));
+    const binDir = join(cwd, 'bin');
+    const fakeCodexPath = join(binDir, 'codex');
+    await mkdir(binDir, { recursive: true });
+    await mkdir(join(cwd, '.omx', 'plans'), { recursive: true });
+    const stalePrdPath = join(cwd, '.omx', 'plans', 'prd-issue-1315.md');
+    await writeFile(
+      stalePrdPath,
+      '# Approved plan\n\nLaunch via omx team 1:executor "Execute approved issue 1315 plan"\n',
+    );
+    await writeFile(join(cwd, '.omx', 'plans', 'test-spec-issue-1315.md'), '# Test spec\n');
+    await rm(stalePrdPath, { force: true });
+    await writeFakePromptWorkerBinary(
+      fakeCodexPath,
+      `setTimeout(() => {}, 5000);`,
+    );
+
+    try {
+      await assert.rejects(
+        () => withPromptModeCodexEnv(binDir, {}, () =>
+          withoutTeamWorkerEnv(() =>
+            startTeam(
+              'team-approved-binding-stale',
+              'approved binding stale start test',
+              'executor',
+              1,
+              [{ subject: 's', description: 'd', owner: 'worker-1' }],
+              cwd,
+              {
+                approvedExecution: {
+                  prd_path: stalePrdPath,
+                  task: 'Execute approved issue 1315 plan',
+                },
+              },
+            ),
+          ),
+        ),
+        /approved_execution_binding_stale:.*Execute approved issue 1315 plan/,
+      );
+      assert.equal(
+        existsSync(join(cwd, '.omx', 'state', 'team', 'team-approved-binding-stale')),
+        false,
+      );
+    } finally {
       await rm(cwd, { recursive: true, force: true });
     }
   });
