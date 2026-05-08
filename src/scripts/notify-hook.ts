@@ -21,6 +21,7 @@
 import { writeFile, appendFile, mkdir, readFile } from 'fs/promises';
 import { existsSync } from 'fs';
 import { dirname, join, resolve } from 'path';
+import { isSessionStateUsable } from '../hooks/session.js';
 
 import { safeString, asNumber } from './notify-hook/utils.js';
 import {
@@ -88,6 +89,43 @@ async function isOmxManagedCwd(cwd: string): Promise<boolean> {
   if (trustedInternalCwd && sameFilePath(trustedInternalCwd, cwd)) return true;
   if (existsSync(join(cwd, '.omx', 'setup-scope.json'))) return true;
   if (existsSync(join(cwd, '.omx', 'managed'))) return true;
+  const sessionStatePath = join(cwd, '.omx', 'state', 'session.json');
+  if (existsSync(sessionStatePath)) {
+    try {
+      const sessionState = JSON.parse(await readFile(sessionStatePath, 'utf-8'));
+      if (isSessionStateUsable(sessionState, cwd)) return true;
+    } catch {
+      // Continue checking other managed markers.
+    }
+  }
+  const teamWorkerEnv = safeString(process.env.OMX_TEAM_INTERNAL_WORKER || process.env.OMX_TEAM_WORKER || '').trim();
+  if (teamWorkerEnv) {
+    const [teamName = '', workerName = ''] = teamWorkerEnv.split('/');
+    if (teamName && workerName) {
+      const candidateStateRoots = [
+        safeString(process.env.OMX_TEAM_STATE_ROOT || '').trim(),
+        join(cwd, '.omx', 'state'),
+      ].filter((value, index, values) => value && values.indexOf(value) === index);
+      for (const candidateStateRoot of candidateStateRoots) {
+        const identityPath = join(candidateStateRoot, 'team', teamName, 'workers', workerName, 'identity.json');
+        if (!existsSync(identityPath)) continue;
+        try {
+          const raw = await readFile(identityPath, 'utf-8');
+          const identity = JSON.parse(raw);
+          const worktreePath = safeString(identity?.worktree_path || '').trim();
+          const stateRoot = safeString(identity?.team_state_root || '').trim();
+          if (
+            (!worktreePath || sameFilePath(worktreePath, cwd))
+            && (!stateRoot || sameFilePath(stateRoot, candidateStateRoot))
+          ) {
+            return true;
+          }
+        } catch {
+          return false;
+        }
+      }
+    }
+  }
   const hooksPath = join(cwd, '.codex', 'hooks.json');
   if (existsSync(hooksPath)) {
     try {
