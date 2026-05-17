@@ -62,6 +62,7 @@ struct CacheMeta {
 const DEFAULT_BUDGET: usize = 1000;
 const STALE_HEARTBEAT_MS: u64 = 120_000;
 const DEFAULT_CACHE_TTL_MS: u64 = 10 * 60 * 1000;
+const CACHE_BODY_VERSION: &str = "omx-sparkshell-cache-v2";
 
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -504,6 +505,7 @@ fn handle_cache_at_path(
 ) -> Result<Option<CacheMeta>, SparkshellError> {
     let now = now_ms();
     let current = combined_text(output);
+    let current_line_count = current.lines().count();
     let mut previous_hash = None;
     let mut cache_hit = false;
     let mut changed_line_ranges = Vec::new();
@@ -516,20 +518,53 @@ fn handle_cache_at_path(
         let old_hash = parts.next().unwrap_or("").to_string();
         let old_body = parts.next().unwrap_or("");
         if now.saturating_sub(timestamp) <= ttl_ms {
+            let old_line_count = cached_line_count(old_body);
             previous_hash = Some(old_hash.clone());
             cache_hit = old_hash == current_hash;
             if !cache_hit {
-                changed_line_ranges = changed_ranges(old_body, &current);
+                changed_line_ranges = changed_ranges(
+                    old_hash.as_str(),
+                    current_hash,
+                    old_line_count,
+                    current_line_count,
+                );
             }
         }
     }
-    fs::write(path, format!("{now}\n{current_hash}\n{current}"))?;
+    fs::write(
+        path,
+        cache_contents(now, current_hash, output, current_line_count),
+    )?;
     Ok(Some(CacheMeta {
         cache_hit,
         previous_hash,
         current_hash: current_hash.to_string(),
         changed_line_ranges,
     }))
+}
+
+fn cache_contents(
+    timestamp_ms: u64,
+    current_hash: &str,
+    output: &CommandOutput,
+    current_line_count: usize,
+) -> String {
+    format!(
+        "{timestamp_ms}\n{current_hash}\n{CACHE_BODY_VERSION}\nlines={current_line_count}\nstdout_lines={}\nstderr_lines={}\n",
+        String::from_utf8_lossy(&output.stdout).lines().count(),
+        String::from_utf8_lossy(&output.stderr).lines().count()
+    )
+}
+
+fn cached_line_count(body: &str) -> usize {
+    if let Some(metadata) = body.strip_prefix(CACHE_BODY_VERSION) {
+        return metadata
+            .lines()
+            .find_map(|line| line.strip_prefix("lines="))
+            .and_then(|value| value.parse::<usize>().ok())
+            .unwrap_or(0);
+    }
+    body.lines().count()
 }
 
 fn since_last_summary(output: &CommandOutput, cache: Option<&CacheMeta>, budget: usize) -> String {
@@ -571,12 +606,15 @@ fn since_last_summary(output: &CommandOutput, cache: Option<&CacheMeta>, budget:
     }
 }
 
-fn changed_ranges(old: &str, new: &str) -> Vec<String> {
-    let old_count = old.lines().count();
-    let new_count = new.lines().count();
-    if new_count > old_count {
-        vec![format!("{}-{}", old_count + 1, new_count)]
-    } else if old != new {
+fn changed_ranges(
+    old_hash: &str,
+    current_hash: &str,
+    old_line_count: usize,
+    current_line_count: usize,
+) -> Vec<String> {
+    if current_line_count > old_line_count {
+        vec![format!("{}-{}", old_line_count + 1, current_line_count)]
+    } else if old_hash != current_hash {
         vec!["1-*".to_string()]
     } else {
         Vec::new()

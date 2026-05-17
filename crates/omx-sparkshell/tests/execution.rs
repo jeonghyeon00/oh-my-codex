@@ -690,3 +690,48 @@ fn pane_json_cache_reports_hits_and_since_last_changes() {
 
     let _ = fs::remove_dir_all(temp);
 }
+
+#[test]
+fn pane_cache_does_not_persist_raw_secret_like_text() {
+    let temp = unique_temp_dir("pane-cache-secret");
+    let tmux = temp.join("tmux");
+    let cache = temp.join("cache");
+    let pane = temp.join("pane.txt");
+    let secret_line = "OPENAI_API_KEY=sk-test-secret";
+    fs::write(&pane, format!("starting\n{secret_line}\nfinished\n")).expect("pane");
+    write_executable(&tmux, &format!("#!/bin/sh\ncat {}\n", pane.display()));
+    let path = format!(
+        "{}:{}",
+        temp.display(),
+        env::var("PATH").unwrap_or_default()
+    );
+
+    let output = Command::new(sparkshell_bin())
+        .env("PATH", &path)
+        .env("OMX_SPARKSHELL_CACHE_DIR", cache.display().to_string())
+        .arg("--json")
+        .arg("--tmux-pane")
+        .arg("%99")
+        .output()
+        .expect("run sparkshell");
+
+    assert!(output.status.success());
+    let cache_file = cache.join("pane-pct99.txt");
+    let cached = fs::read_to_string(&cache_file).expect("cache file");
+    assert!(
+        !cached.contains(secret_line),
+        "cache file persisted raw secret-like pane text: {cached}"
+    );
+    assert!(
+        !cached.contains("sk-test-secret"),
+        "cache file persisted raw token value: {cached}"
+    );
+    assert!(
+        !cached.contains("OPENAI_API_KEY"),
+        "cache file persisted raw secret variable name: {cached}"
+    );
+    assert!(cached.contains("omx-sparkshell-cache-v2"));
+    assert!(cached.contains("lines=3"));
+
+    let _ = fs::remove_dir_all(temp);
+}
