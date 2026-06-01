@@ -60,6 +60,12 @@ function runNotifyHook(
     encoding: 'utf-8',
     env: {
       ...process.env,
+      OMX_ROOT: '',
+      OMX_STATE_ROOT: '',
+      OMX_TEAM_STATE_ROOT: '',
+      CODEX_SESSION_ID: '',
+      SESSION_ID: '',
+      OMX_SESSION_ID: '',
       OMX_TEAM_WORKER: '',
       TMUX: '',
       TMUX_PANE: '',
@@ -128,7 +134,7 @@ describe('notify-hook session-idle dedupe', () => {
   });
 
 
-  it('writes session-idle hook state into the fork session scope when OMX_SESSION_ID targets a fork', async () => {
+  it('does not write session-idle hook state into an inherited OMX_SESSION_ID fork without usable session metadata', async () => {
     const wd = await mkdtemp(join(tmpdir(), 'omx-notify-idle-fork-scope-'));
     const repoRoot = join(dirname(fileURLToPath(import.meta.url)), '..', '..', '..');
 
@@ -149,8 +155,8 @@ describe('notify-hook session-idle dedupe', () => {
       });
       assert.equal(result.status, 0, result.stderr || result.stdout);
 
-      assert.equal(existsSync(join(stateDir, 'sessions', forkSessionId, 'session-idle-hook-state.json')), true);
-      assert.equal(existsSync(join(stateDir, 'sessions', canonicalSessionId, 'session-idle-hook-state.json')), false);
+      assert.equal(existsSync(join(stateDir, 'sessions', forkSessionId, 'session-idle-hook-state.json')), false);
+      assert.equal(existsSync(join(stateDir, 'sessions', canonicalSessionId, 'session-idle-hook-state.json')), true);
       const pluginState = await readJson<{ count: number }>(pluginStatePath);
       assert.equal(pluginState.count, 1);
     } finally {

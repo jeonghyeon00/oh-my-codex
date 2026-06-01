@@ -4119,8 +4119,8 @@ export async function dispatchCodexNativeHook(
     }
   }
 
-  const eventSessionId = canonicalSessionId || nativeSessionId || undefined;
-  const sessionIdForState = canonicalSessionId || nativeSessionId;
+  let eventSessionId = canonicalSessionId || nativeSessionId || undefined;
+  let sessionIdForState = canonicalSessionId || nativeSessionId;
   let outputJson: Record<string, unknown> | null = null;
   const isSubagentPromptSubmit = hookEventName === "UserPromptSubmit"
     ? await isNativeSubagentHook(
@@ -4151,6 +4151,23 @@ export async function dispatchCodexNativeHook(
   const suppressNoisySubagentLifecycleDispatch =
     (isSubagentSessionStart || isSubagentStop)
     && shouldSuppressSubagentLifecycleHookDispatch();
+
+  if (hookEventName === "UserPromptSubmit" && nativeSessionId && !canonicalSessionId && !isSubagentPromptSubmit) {
+    const prompt = readPromptText(payload);
+    const match = prompt ? detectPrimaryKeyword(prompt) : null;
+    if (match?.skill !== "team") {
+      canonicalSessionId = nativeSessionId;
+      resolvedNativeSessionId = nativeSessionId;
+      eventSessionId = canonicalSessionId || nativeSessionId || undefined;
+      sessionIdForState = canonicalSessionId || nativeSessionId;
+      await writeFile(join(stateDir, "session.json"), JSON.stringify({
+        session_id: canonicalSessionId,
+        native_session_id: nativeSessionId,
+        started_at: new Date().toISOString(),
+        cwd,
+      }, null, 2)).catch(() => {});
+    }
+  }
 
   if (hookEventName === "UserPromptSubmit") {
     const prompt = readPromptText(payload);
